@@ -119,6 +119,22 @@ describe("Chinese provider overload messages", () => {
   });
 });
 
+describe("Google API key validation errors (#114784)", () => {
+  const GOOGLE_INVALID_API_KEY =
+    "Google Generative AI API error (400): API key not valid. Please pass a valid API key. [code=INVALID_ARGUMENT]";
+
+  it("classifies Google API key not valid payloads as auth", () => {
+    expect(isAuthErrorMessage(GOOGLE_INVALID_API_KEY)).toBe(true);
+    expect(classifyFailoverReason(GOOGLE_INVALID_API_KEY)).toBe("auth");
+  });
+
+  it("does not classify bare INVALID_ARGUMENT as auth", () => {
+    expect(isAuthErrorMessage("INVALID_ARGUMENT: input exceeds the maximum number of tokens")).toBe(
+      false,
+    );
+  });
+});
+
 describe("Volcengine Coding Plan subscription errors", () => {
   it("classifies InvalidSubscription JSON body as billing", () => {
     const raw =

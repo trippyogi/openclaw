@@ -50,6 +50,28 @@ describe("classifyEmbeddedAgentRunResultForModelFallback", () => {
     });
   });
 
+  it("classifies Google invalid API key payloads as auth fallback", () => {
+    const rawError =
+      "Google Generative AI API error (400): API key not valid. Please pass a valid API key. [code=INVALID_ARGUMENT]";
+    const result = classifyEmbeddedAgentRunResultForModelFallback({
+      provider: "google",
+      model: "gemini-3.1-pro-preview",
+      result: {
+        payloads: [{ isError: true, text: rawError }],
+        meta: {
+          durationMs: 42,
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      message: `google/gemini-3.1-pro-preview ended with a provider error: ${rawError}`,
+      reason: "auth",
+      code: "embedded_error_payload",
+      rawError,
+    });
+  });
+
   it("classifies structured provider upstream_error payloads as fallback-worthy", () => {
     const rawError =
       '{"error":{"message":"Upstream request failed","type":"upstream_error","param":"","code":null}}';

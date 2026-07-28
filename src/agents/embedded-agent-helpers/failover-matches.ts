@@ -19,6 +19,7 @@ const HIGH_CONFIDENCE_AUTH_PERMANENT_PATTERNS = [
 
 const AMBIGUOUS_AUTH_ERROR_PATTERNS = [
   /invalid[_ ]?api[_ ]?key/,
+  /api[_ ]?key[_ ]?(?:not[_ ]?valid|invalid)/,
   /could not (?:authenticate|validate).*(?:api[_ ]?key|credentials)/i,
   "permission_error",
 ] as const satisfies readonly ErrorPattern[];
