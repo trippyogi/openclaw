@@ -45,7 +45,7 @@ Where to execute. `auto` resolves to `sandbox` when a sandbox runtime is active 
 </ParamField>
 
 <ParamField path="security" type="'deny' | 'allowlist' | 'full'">
-Ignored for normal tool calls. `gateway`/`node` security is derived from `tools.exec.mode` and the host approvals file; elevated mode can force full access only when the operator explicitly grants elevated access.
+Ignored for normal tool calls. `gateway`/`node` security is derived from `tools.exec.mode` and the host approvals policy; elevated mode can force full access only when the operator explicitly grants elevated access.
 </ParamField>
 
 <ParamField path="ask" type="'off' | 'on-miss' | 'always'">
@@ -66,7 +66,7 @@ Notes:
 - Per-call `host=node` is allowed from `auto`; per-call `host=gateway` is only allowed when no sandbox runtime is active.
 - With no extra config, `host=auto` still "just works": no sandbox means it resolves to `gateway`; a live sandbox means it stays in the sandbox.
 - `elevated` escapes the sandbox onto the configured host path: `gateway` by default, or `node` when `tools.exec.host=node` (or the session default is `host=node`). It is only available when elevated access is enabled for the current session/provider.
-- `gateway`/`node` approvals are controlled by the host approvals file.
+- `gateway`/`node` approvals are controlled by the host approvals policy.
 - `node` requires a paired node (companion app or headless node host). If multiple nodes are available, set `exec.node` or `tools.exec.node` to select one.
 - `exec host=node` is the only shell-execution path for nodes; the legacy `nodes.run` wrapper has been removed.
 - On non-Windows hosts, exec uses `SHELL` when set; if `SHELL` is `fish`, it prefers `bash` (or `sh`) from `PATH` to avoid fish-incompatible bashisms, then falls back to `SHELL` if neither exists.
@@ -101,7 +101,7 @@ Notes:
 | `tools.exec.safeBinTrustedDirs`      | `/bin`, `/usr/bin`       | Additional explicit directories trusted for `safeBins` path checks. `PATH` entries are never auto-trusted.                                              |
 | `tools.exec.safeBinProfiles`         | unset                    | Optional custom argv policy per safe bin (`minPositional`, `maxPositional`, `allowedValueFlags`, `deniedFlags`).                                        |
 
-No-approval host exec is the default for gateway and node (`mode=full`) — this comes from the host-policy defaults, not from `host=auto`. If you want approvals/allowlist behavior, set `tools.exec.mode` and tighten the host approvals file; see [Exec approvals](/tools/exec-approvals#yolo-mode-no-approval). To force gateway or node routing regardless of sandbox state, set `tools.exec.host` or use `/exec host=...`.
+No-approval host exec is the default for gateway and node (`mode=full`) — this comes from the host-policy defaults, not from `host=auto`. If you want approvals/allowlist behavior, set `tools.exec.mode` and tighten the host approvals policy; see [Exec approvals](/tools/exec-approvals#yolo-mode-no-approval). To force gateway or node routing regardless of sandbox state, set `tools.exec.host` or use `/exec host=...`.
 
 Example:
 

@@ -64,7 +64,7 @@ Three separate gates control whether a node command succeeds:
 2. **Gateway node command policy**: is the RPC command ID allowed by `gateway.nodes.commands.allow` / `gateway.nodes.commands.deny` and platform defaults?
 3. **Exec approvals**: can this node run a specific shell command locally?
 
-Node pairing is an identity/trust gate, not a per-command approval surface. For `system.run`, the per-node policy lives in that node's exec approvals file (`openclaw approvals get --node ...`), not in the gateway pairing record.
+Node pairing is an identity/trust gate, not a per-command approval surface. For `system.run`, the per-node policy lives in that node's exec approvals state (`openclaw approvals get --node ...`), not in the gateway pairing record.
 
 Quick checks:
 
