@@ -293,6 +293,11 @@ export function restoreSessionSqliteMigrationRuns(params: {
   trustedTargets: readonly SessionSqliteMigrationTargetInput[];
 }): DoctorSessionSqliteRestoreReport {
   const restoreReport: DoctorSessionSqliteRestoreReport = emptyRestoreReport();
+  const loadedManifests: Array<{
+    manifest: SessionSqliteMigrationManifest;
+    manifestPath: string;
+    targets: SessionSqliteMigrationTargetManifest[];
+  }> = [];
   for (const manifestPath of listSessionSqliteMigrationManifestPaths(params.env)) {
     const manifest = readSessionSqliteMigrationManifest(manifestPath);
     if (!manifest) {
@@ -302,12 +307,26 @@ export function restoreSessionSqliteMigrationRuns(params: {
     if (targetManifests.length === 0) {
       continue;
     }
+    loadedManifests.push({ manifest, manifestPath, targets: targetManifests });
+  }
+  // Plan legacy-store (sessions.json) destinations across every manifest before any rename,
+  // so a newer empty `{}` archive cannot claim the path and force restore_conflict on a
+  // later nonempty pre-migration archive (#116163).
+  const legacyStorePlan = planLegacyStoreRestoresAcrossTargets(
+    loadedManifests.flatMap((item) => item.targets),
+  );
+  for (const { manifest, manifestPath, targets } of loadedManifests) {
     const manifestRestoreReport: DoctorSessionSqliteRestoreReport = {
       ...emptyRestoreReport(),
       manifestPaths: [manifestPath],
     };
     restoreReport.manifestPaths.push(manifestPath);
-    restoreSessionSqliteMigrationManifest(manifest, targetManifests, manifestRestoreReport);
+    restoreSessionSqliteMigrationManifest(
+      manifest,
+      targets,
+      manifestRestoreReport,
+      legacyStorePlan,
+    );
     restoreReport.conflicts.push(...manifestRestoreReport.conflicts);
     restoreReport.restoredFiles.push(...manifestRestoreReport.restoredFiles);
     restoreReport.skippedFiles.push(...manifestRestoreReport.skippedFiles);
@@ -342,7 +361,12 @@ export function restoreSessionSqliteMigrationRun(params: {
     });
     return restoreReport;
   }
-  restoreSessionSqliteMigrationManifest(manifest, targetManifests, restoreReport);
+  restoreSessionSqliteMigrationManifest(
+    manifest,
+    targetManifests,
+    restoreReport,
+    planLegacyStoreRestoresAcrossTargets(targetManifests),
+  );
   writeSessionSqliteMigrationManifest({ manifest, manifestPath: params.manifestPath });
   return restoreReport;
 }
@@ -495,14 +519,23 @@ function emptyRestoreReport(): DoctorSessionSqliteRestoreReport {
   };
 }
 
+type LegacyStoreRestorePlan = {
+  ambiguous: boolean;
+  candidates: SessionSqliteMigrationMove[];
+  selectedArchivePath?: string;
+};
+
+type SessionsJsonArchiveClass = "empty" | "invalid" | "nonempty";
+
 function restoreSessionSqliteMigrationManifest(
   manifest: SessionSqliteMigrationManifest,
   targets: readonly SessionSqliteMigrationTargetManifest[],
   restoreReport: DoctorSessionSqliteRestoreReport,
+  legacyStorePlan: Map<string, LegacyStoreRestorePlan>,
 ): void {
   for (const target of targets) {
     for (const move of uniqueRestoreMoves(target)) {
-      restoreMigrationMove(move, restoreReport);
+      restoreMigrationMove(move, restoreReport, legacyStorePlan);
     }
   }
   manifest.restore = {
@@ -524,10 +557,162 @@ function uniqueRestoreMoves(
   return [...moves.values()];
 }
 
+function planLegacyStoreRestoresAcrossTargets(
+  targets: readonly SessionSqliteMigrationTargetManifest[],
+): Map<string, LegacyStoreRestorePlan> {
+  const byDestination = new Map<string, SessionSqliteMigrationMove[]>();
+  for (const target of targets) {
+    for (const move of uniqueRestoreMoves(target)) {
+      if (move.kind !== "legacy-store") {
+        continue;
+      }
+      const destinationKey = canonicalMigrationFilePath(move.sourcePath);
+      const existing = byDestination.get(destinationKey) ?? [];
+      if (
+        !existing.some(
+          (candidate) =>
+            canonicalMigrationFilePath(candidate.archivePath) ===
+            canonicalMigrationFilePath(move.archivePath),
+        )
+      ) {
+        existing.push(move);
+      }
+      byDestination.set(destinationKey, existing);
+    }
+  }
+  const plans = new Map<string, LegacyStoreRestorePlan>();
+  for (const [destinationKey, candidates] of byDestination) {
+    plans.set(destinationKey, planLegacyStoreRestore(destinationKey, candidates));
+  }
+  return plans;
+}
+
+function planLegacyStoreRestore(
+  sourcePath: string,
+  candidates: readonly SessionSqliteMigrationMove[],
+): LegacyStoreRestorePlan {
+  // Destination already present: keep per-move skip/conflict behavior; do not pick a winner.
+  if (fs.existsSync(sourcePath)) {
+    return { ambiguous: false, candidates: [...candidates] };
+  }
+  const available: Array<{
+    archiveClass: SessionsJsonArchiveClass;
+    move: SessionSqliteMigrationMove;
+  }> = [];
+  for (const move of candidates) {
+    if (!fs.existsSync(move.archivePath)) {
+      continue;
+    }
+    available.push({
+      archiveClass: classifySessionsJsonArchive(move.archivePath),
+      move,
+    });
+  }
+  if (available.length === 0) {
+    return { ambiguous: false, candidates: [...candidates] };
+  }
+  const nonempty = available
+    .filter((item) => item.archiveClass === "nonempty")
+    .map((item) => item.move);
+  if (nonempty.length === 1) {
+    return {
+      ambiguous: false,
+      candidates: [...candidates],
+      selectedArchivePath: nonempty[0]?.archivePath,
+    };
+  }
+  if (nonempty.length > 1) {
+    return { ambiguous: true, candidates: nonempty };
+  }
+  const empty = available.filter((item) => item.archiveClass === "empty").map((item) => item.move);
+  if (empty.length === 1 && available.length === 1) {
+    return {
+      ambiguous: false,
+      candidates: [...candidates],
+      selectedArchivePath: empty[0]?.archivePath,
+    };
+  }
+  if (available.length === 1) {
+    // Sole remaining archive (including invalid JSON): keep prior restore attempt behavior.
+    return {
+      ambiguous: false,
+      candidates: [...candidates],
+      selectedArchivePath: available[0]?.move.archivePath,
+    };
+  }
+  // Multiple empty archives, or mixed empty/invalid with no nonempty winner: write nothing.
+  return {
+    ambiguous: true,
+    candidates: available.map((item) => item.move),
+  };
+}
+
+function classifySessionsJsonArchive(archivePath: string): SessionsJsonArchiveClass {
+  try {
+    if (!isRegularFileWithoutFollowingSymlinks(archivePath)) {
+      return "invalid";
+    }
+    const parsed: unknown = JSON.parse(fs.readFileSync(archivePath, "utf-8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return "invalid";
+    }
+    return Object.keys(parsed).length === 0 ? "empty" : "nonempty";
+  } catch {
+    return "invalid";
+  }
+}
+
+function describeLegacyStoreArchiveCandidate(move: SessionSqliteMigrationMove): string {
+  const archiveClass = classifySessionsJsonArchive(move.archivePath);
+  try {
+    const sizeBytes = fs.lstatSync(move.archivePath).size;
+    if (archiveClass === "empty" || archiveClass === "nonempty") {
+      const parsed = JSON.parse(fs.readFileSync(move.archivePath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      return `${move.archivePath} (${archiveClass}, ${Object.keys(parsed).length} entries, ${sizeBytes} bytes)`;
+    }
+    return `${move.archivePath} (${archiveClass}, ${sizeBytes} bytes)`;
+  } catch {
+    return `${move.archivePath} (${archiveClass})`;
+  }
+}
+
 function restoreMigrationMove(
   move: SessionSqliteMigrationMove,
   restoreReport: DoctorSessionSqliteRestoreReport,
+  legacyStorePlan: Map<string, LegacyStoreRestorePlan>,
 ): void {
+  if (move.kind === "legacy-store") {
+    const plan = legacyStorePlan.get(canonicalMigrationFilePath(move.sourcePath));
+    if (plan?.ambiguous) {
+      const isReportedCandidate = plan.candidates.some(
+        (candidate) =>
+          canonicalMigrationFilePath(candidate.archivePath) ===
+          canonicalMigrationFilePath(move.archivePath),
+      );
+      if (!isReportedCandidate) {
+        return;
+      }
+      restoreReport.conflicts.push({
+        archivePath: move.archivePath,
+        reason: `ambiguous sessions.json archives; refusing restore. Candidates: ${plan.candidates
+          .map((candidate) => describeLegacyStoreArchiveCandidate(candidate))
+          .join("; ")}`,
+        sourcePath: move.sourcePath,
+      });
+      return;
+    }
+    if (
+      plan?.selectedArchivePath !== undefined &&
+      canonicalMigrationFilePath(plan.selectedArchivePath) !==
+        canonicalMigrationFilePath(move.archivePath)
+    ) {
+      // Non-winner (typically empty `{}`) — do not rename and do not raise restore_conflict.
+      return;
+    }
+  }
   const sourceExists = fs.existsSync(move.sourcePath);
   const archiveExists = fs.existsSync(move.archivePath);
   if (!sourceExists && archiveExists) {
