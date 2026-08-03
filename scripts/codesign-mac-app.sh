@@ -125,6 +125,50 @@ macOS restart.
 WARN
 fi
 
+# Determines whether $1 is (or resolves to) a Developer ID Application
+# identity, so CODESIGN_TIMESTAMP=auto knows when a trusted timestamp is
+# appropriate. SIGN_IDENTITY may be a full/partial common name (checked
+# directly) or a SHA-1 hash (looked up via `security find-identity`), since
+# `codesign --sign` accepts either form.
+identity_is_developer_id_application() {
+  local identity="$1"
+
+  if [[ "$identity" == *"Developer ID Application"* ]]; then
+    return 0
+  fi
+
+  # Hashes are hex-only; anything else is a CN we already know doesn't match.
+  if ! [[ "$identity" =~ ^[0-9A-Fa-f]+$ ]]; then
+    return 1
+  fi
+
+  local identity_lower
+  identity_lower="$(printf '%s' "$identity" | tr '[:upper:]' '[:lower:]')"
+
+  local line hash hash_lower cn matched_cn=""
+  local match_count=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\"([^\"]*)\" ]]; then
+      hash="${BASH_REMATCH[1]}"
+      cn="${BASH_REMATCH[2]}"
+      hash_lower="$(printf '%s' "$hash" | tr '[:upper:]' '[:lower:]')"
+      case "$hash_lower" in
+        "$identity_lower"*)
+          match_count=$((match_count + 1))
+          matched_cn="$cn"
+          ;;
+      esac
+    fi
+  done < <(security find-identity -p codesigning -v 2>/dev/null || true)
+
+  if [[ "$match_count" -ne 1 ]]; then
+    echo "WARN: CODESIGN_TIMESTAMP=auto could not uniquely resolve SIGN_IDENTITY hash \"$identity\" via 'security find-identity -p codesigning -v'; using --timestamp=none. Set CODESIGN_TIMESTAMP=on to force a trusted timestamp." >&2
+    return 1
+  fi
+
+  [[ "$matched_cn" == *"Developer ID Application"* ]]
+}
+
 timestamp_arg="--timestamp=none"
 case "$TIMESTAMP_MODE" in
   1|on|yes|true)
@@ -134,7 +178,7 @@ case "$TIMESTAMP_MODE" in
     timestamp_arg="--timestamp=none"
     ;;
   auto)
-    if [[ "$IDENTITY" == *"Developer ID Application"* ]]; then
+    if identity_is_developer_id_application "$IDENTITY"; then
       timestamp_arg="--timestamp"
     fi
     ;;

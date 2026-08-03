@@ -83,6 +83,89 @@ fi
   chmodSync(fakeCodesign, 0o755);
 }
 
+function installFakeSecurity(binDir: string, findIdentityOutput: string) {
+  const fakeSecurity = path.join(binDir, "security");
+  writeFileSync(
+    fakeSecurity,
+    `#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "\${1:-}" = "find-identity" ]; then
+  cat <<'IDENTITIES'
+${findIdentityOutput}
+IDENTITIES
+  exit 0
+fi
+
+echo "unsupported fake security invocation: $*" >&2
+exit 1
+`,
+  );
+  chmodSync(fakeSecurity, 0o755);
+}
+
+function installFakeCodesignCapturingTimestamp(binDir: string) {
+  const fakeCodesign = path.join(binDir, "codesign");
+  writeFileSync(
+    fakeCodesign,
+    `#!/usr/bin/env bash
+set -euo pipefail
+
+timestamp_arg="(none-present)"
+for arg in "$@"; do
+  case "$arg" in
+    --timestamp|--timestamp=none)
+      timestamp_arg="$arg"
+      ;;
+  esac
+done
+
+printf '%s\\n' "$timestamp_arg" >>"$CODESIGN_TIMESTAMP_LOG"
+`,
+  );
+  chmodSync(fakeCodesign, 0o755);
+}
+
+const FAKE_IDENTITIES = [
+  '  1) 61FA3931889DF30F4EBE96CA1D2FB4B308694A5 "Developer ID Application: OpenClaw Inc (ABCDE12345)"',
+  '  2) 71FA3931889DF30F4EBE96CA1D2FB4B308694A6 "Apple Development: Jane Doe (ABCDE12345)"',
+  "     2 valid identities found",
+].join("\n");
+
+function runTimestampScenario(env: Record<string, string>): {
+  status: number | null;
+  stderr: string;
+  timestampArgs: string[];
+} {
+  const tempRoot = makeTempDir("openclaw-codesign-timestamp-");
+  const app = path.join(tempRoot, "Fake.app");
+  const binDir = path.join(tempRoot, "bin");
+  const timestampLog = path.join(tempRoot, "timestamp.log");
+  mkdirSync(path.join(app, "Contents", "MacOS"), { recursive: true });
+  mkdirSync(binDir);
+  installFakeCodesignCapturingTimestamp(binDir);
+  installFakeSecurity(binDir, FAKE_IDENTITIES);
+
+  const result = spawnSync("bash", [scriptPath, app], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ...env,
+      CODESIGN_TIMESTAMP_LOG: timestampLog,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      SKIP_TEAM_ID_CHECK: "1",
+      TMPDIR: tempRoot,
+    },
+  });
+
+  const timestampArgs = existsSync(timestampLog)
+    ? readFileSync(timestampLog, "utf8").trim().split("\n").filter(Boolean)
+    : [];
+
+  return { status: result.status, stderr: result.stderr, timestampArgs };
+}
+
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -209,5 +292,69 @@ describe("codesign-mac-app temp file hygiene", () => {
       expect(copiedEntitlements).toContain("com.apple.security.device.camera");
     }
     expect(entitlementTemps(tempRoot)).toEqual([]);
+  });
+});
+
+describe("codesign-mac-app CODESIGN_TIMESTAMP resolution", () => {
+  it("enables --timestamp for a name-form Developer ID identity under auto", () => {
+    const { status, timestampArgs } = runTimestampScenario({
+      SIGN_IDENTITY: "Developer ID Application: OpenClaw Inc (ABCDE12345)",
+    });
+
+    expect(status).toBe(0);
+    expect(timestampArgs).toEqual(["--timestamp"]);
+  });
+
+  it("enables --timestamp when a SHA-1 hash resolves to a Developer ID Application identity", () => {
+    const { status, stderr, timestampArgs } = runTimestampScenario({
+      SIGN_IDENTITY: "61FA3931",
+    });
+
+    expect(status).toBe(0);
+    expect(stderr).not.toContain("WARN: CODESIGN_TIMESTAMP=auto could not");
+    expect(timestampArgs).toEqual(["--timestamp"]);
+  });
+
+  it("keeps --timestamp=none when a SHA-1 hash resolves to an Apple Development identity", () => {
+    const { status, stderr, timestampArgs } = runTimestampScenario({
+      SIGN_IDENTITY: "71FA3931",
+    });
+
+    expect(status).toBe(0);
+    expect(stderr).not.toContain("WARN: CODESIGN_TIMESTAMP=auto could not");
+    expect(timestampArgs).toEqual(["--timestamp=none"]);
+  });
+
+  it("warns and keeps --timestamp=none for a hash that does not resolve under auto", () => {
+    const { status, stderr, timestampArgs } = runTimestampScenario({
+      SIGN_IDENTITY: "DEADBEEF00",
+    });
+
+    expect(status).toBe(0);
+    expect(stderr).toContain(
+      'WARN: CODESIGN_TIMESTAMP=auto could not uniquely resolve SIGN_IDENTITY hash "DEADBEEF00"',
+    );
+    expect(stderr).toContain("CODESIGN_TIMESTAMP=on");
+    expect(timestampArgs).toEqual(["--timestamp=none"]);
+  });
+
+  it("enables --timestamp for an Apple Development identity when explicitly forced on", () => {
+    const { status, timestampArgs } = runTimestampScenario({
+      CODESIGN_TIMESTAMP: "on",
+      SIGN_IDENTITY: "Apple Development: Jane Doe (ABCDE12345)",
+    });
+
+    expect(status).toBe(0);
+    expect(timestampArgs).toEqual(["--timestamp"]);
+  });
+
+  it("keeps --timestamp=none for ad-hoc signing regardless of CODESIGN_TIMESTAMP", () => {
+    const { status, timestampArgs } = runTimestampScenario({
+      CODESIGN_TIMESTAMP: "on",
+      SIGN_IDENTITY: "-",
+    });
+
+    expect(status).toBe(0);
+    expect(timestampArgs).toEqual(["--timestamp=none"]);
   });
 });
