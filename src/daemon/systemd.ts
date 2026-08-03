@@ -309,7 +309,20 @@ export { enableSystemdUserLinger, readSystemdUserLingerStatus };
 export async function readSystemdServiceExecStart(
   env: GatewayServiceEnv,
 ): Promise<GatewayServiceCommandConfig | null> {
-  const unitPath = resolveSystemdUnitPath(env);
+  return readSystemdServiceExecStartAtPath(resolveSystemdUnitPath(env), env);
+}
+
+/**
+ * Same parse as readSystemdServiceExecStart, but for an already-known unit
+ * path. readSystemdServiceExecStart always resolves the user-scope path;
+ * callers that already resolved a system-scope unit (e.g. via
+ * findInstalledSystemdGatewayScope) need this to read the unit that is
+ * actually installed instead of a user-scope path that may not exist.
+ */
+async function readSystemdServiceExecStartAtPath(
+  unitPath: string,
+  env: GatewayServiceEnv,
+): Promise<GatewayServiceCommandConfig | null> {
   try {
     const content = await fs.readFile(unitPath, "utf8");
     let execStart = "";
@@ -1406,6 +1419,97 @@ async function writeSystemdGatewayEnvironmentFile(params: {
   return { environmentFiles: [envFilePath], environmentKeys };
 }
 
+/**
+ * Re-syncs the generated systemd EnvironmentFile from the current state-dir
+ * `.env` before a plain start/restart. Re-staging (writeSystemdUnit) already
+ * refreshes this file, but a plain `systemctl restart` never re-runs staging,
+ * so an operator edit to `.env` was silently ignored until the next repair or
+ * `openclaw gateway install --force` (#118503). This reuses the exact
+ * writeSystemdGatewayEnvironmentFile drop/merge so file-managed operator
+ * secrets and the #76860 inline-managed drop behave identically to a re-stage.
+ *
+ * Best-effort only: this mirrors the `readCommand(...).catch(() => null)`
+ * pattern every other caller of readSystemdServiceExecStart already uses
+ * (see service.ts's readGatewayServiceState). A missing/unparsable unit file,
+ * a HOME-less environment, or any other read failure must never block the
+ * start/restart it runs ahead of.
+ *
+ * `unitPath` must be the already-resolved unit path for the scope actually
+ * being started/restarted (user or system). readSystemdServiceExecStart
+ * always assumes user-scope, which would silently no-op this refresh for a
+ * system-scope install.
+ */
+async function refreshSystemdManagedEnvironmentFile(
+  unitPath: string,
+  env: GatewayServiceEnv,
+): Promise<void> {
+  const command = await readSystemdServiceExecStartAtPath(unitPath, env).catch(() => null);
+  if (!command) {
+    // Nothing installed to refresh; a start-repair or install flow owns
+    // first-time EnvironmentFile wiring.
+    return;
+  }
+  try {
+    const fileManagedKeys = collectSystemdFileManagedKeys({
+      environmentValueSources: command.environmentValueSources,
+    });
+    const inlineManagedKeys = collectSystemdInlineManagedKeys({
+      environment: command.environment,
+      environmentValueSources: command.environmentValueSources,
+    });
+    const stateDir = resolveStateDir(env as NodeJS.ProcessEnv);
+    const { entries: stateDirDotEnvEntries, skippedShellReferenceKeys } =
+      readStateDirDotEnvFromStateDir(stateDir);
+    // Only pure-inline values (never file-backed) can out-rank a fresh state-dir
+    // .env value; a file-managed key's current value originated from this same
+    // env file and must not block the refresh from applying the new content.
+    const inlineOnlyEnvironment: Record<string, string> = {};
+    for (const [key, value] of Object.entries(command.environment ?? {})) {
+      const source = readEnvironmentValueSource(command.environmentValueSources, key);
+      if (hasInlineEnvironmentSource(source) && !hasEnvironmentFileSource(source)) {
+        inlineOnlyEnvironment[key] = value;
+      }
+    }
+    const dotenvVars = Object.fromEntries(
+      Object.entries(stateDirDotEnvEntries).filter(([key, value]) => {
+        const inlineValue = inlineOnlyEnvironment[key];
+        if (typeof inlineValue !== "string") {
+          return true;
+        }
+        return inlineValue.trim() === value.trim();
+      }),
+    );
+    // At the writeSystemdUnit re-stage call site, `environment` is the fresh
+    // effective config the caller just recomputed, so a stale file-managed
+    // value read back from that snapshot is already current. Here
+    // command.environment is exactly the pre-refresh EnvironmentFile content,
+    // so falling back to it for a key that .env also defines would let the
+    // stale value win the writeSystemdGatewayEnvironmentFile merge (which
+    // spreads fileBackedEnvironment after dotenvVars) and silently no-op the
+    // whole refresh. Only keys .env no longer defines - operator secrets
+    // added straight to gateway.systemd.env - fall back to their last value.
+    const staleFileBackedEnvironment = collectSystemdFileBackedEnvironment({
+      environment: command.environment,
+      fileManagedKeys,
+    });
+    const fileBackedEnvironment = Object.fromEntries(
+      Object.entries(staleFileBackedEnvironment).filter(([key]) => !(key in dotenvVars)),
+    );
+    await writeSystemdGatewayEnvironmentFile({
+      stateDir,
+      dotenvVars,
+      inlineManagedKeys,
+      fileManagedKeys,
+      skippedManagedKeys: skippedShellReferenceKeys,
+      fileBackedEnvironment,
+      environment: command.environment,
+    });
+  } catch {
+    // Same best-effort contract as above: a write failure here must not
+    // block the start/restart action that follows.
+  }
+}
+
 async function removeNodeSystemdManagedEnvironmentKeys(env: GatewayServiceEnv): Promise<void> {
   if (!isNodeSystemdEnvironment(env)) {
     return;
@@ -1607,6 +1711,13 @@ async function runSystemdServiceAction(params: {
       );
     }
     if (params.action !== "stop") {
+      // Re-sync gateway.systemd.env from the current state-dir .env before the
+      // unit reloads it. A plain restart never re-runs staging, so this is the
+      // only place an operator .env edit reaches a running gateway (#118503).
+      // installed.unitPath is the actual system-scope unit; the default
+      // resolver in refreshSystemdManagedEnvironmentFile assumes user-scope
+      // and would silently no-op against a system-scope install.
+      await refreshSystemdManagedEnvironmentFile(installed.unitPath, env);
       // systemd latches a unit into failed/start-limit-hit after it crashes faster
       // than StartLimitBurst allows and then stops auto-restarting it. Clear the
       // latch before start/restart so an operator can recover a crash-looped
@@ -1624,6 +1735,14 @@ async function runSystemdServiceAction(params: {
   await assertSystemdAvailable(env);
   if (params.action !== "stop") {
     await assertNoSystemGatewayOwnership(env);
+    // Re-sync gateway.systemd.env from the current state-dir .env before the
+    // unit reloads it; see the system-scope branch above for why (#118503).
+    // No installed unit yet (e.g. a start before any install/stage) means
+    // nothing to refresh; the upcoming install/repair flow owns first-time
+    // EnvironmentFile wiring instead.
+    if (installed?.unitPath) {
+      await refreshSystemdManagedEnvironmentFile(installed.unitPath, env);
+    }
     // Clear the same latch for user-scope start/restart after the ownership
     // guard, so a conflicting system unit is never mutated.
     await execSystemctlUser(env, ["reset-failed", unitName]);

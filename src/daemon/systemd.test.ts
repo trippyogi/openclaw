@@ -166,6 +166,15 @@ function assertMachineUserSystemctlArgs(args: string[], user: string, ...command
 }
 
 function mockEffectiveUid(uid: number) {
+  // Windows Node has no process.geteuid; define it so system-scope root checks
+  // and vi.spyOn callers both work under the daemon test lane.
+  if (typeof process.geteuid !== "function") {
+    Object.defineProperty(process, "geteuid", {
+      configurable: true,
+      value: () => uid,
+    });
+    return;
+  }
   vi.spyOn(process, "geteuid").mockReturnValue(uid);
 }
 
@@ -3127,6 +3136,327 @@ describe("systemd service control", () => {
         cb(null, "", "");
       });
     await assertRestartSuccess({ USER: "debian" });
+  });
+});
+
+describe("systemd managed env refresh on start/restart (#118503)", () => {
+  async function withInstalledUnitFixture(
+    run: (context: {
+      env: Record<string, string>;
+      stateDir: string;
+      unitPath: string;
+      envFilePath: string;
+    }) => Promise<void>,
+  ): Promise<void> {
+    const tempHomeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-systemd-refresh-"));
+    const home = path.join(tempHomeRoot, "home");
+    const stateDir = path.join(home, ".openclaw");
+    const env = {
+      HOME: home,
+      OPENCLAW_STATE_DIR: stateDir,
+      OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway-refresh-test",
+    };
+    const unitPath = resolveSystemdUserUnitPath(env);
+    const envFilePath = path.join(stateDir, "gateway.systemd.env");
+    try {
+      await fs.mkdir(stateDir, { recursive: true });
+      await fs.mkdir(path.dirname(unitPath), { recursive: true });
+      await run({ env, stateDir, unitPath, envFilePath });
+    } finally {
+      await fs.rm(tempHomeRoot, { recursive: true, force: true });
+    }
+  }
+
+  const REFRESH_TEST_UNIT_NAME = "openclaw-gateway-refresh-test.service";
+
+  function mockRestartSystemctlSequence() {
+    execFileMock
+      .mockImplementationOnce((_cmd, args, _opts, cb) => {
+        assertUserSystemctlArgs(args, "status");
+        cb(null, "", "");
+      })
+      .mockImplementationOnce((_cmd, args, _opts, cb) => {
+        assertUserSystemctlArgs(args, "reset-failed", REFRESH_TEST_UNIT_NAME);
+        cb(null, "", "");
+      })
+      .mockImplementationOnce((_cmd, args, _opts, cb) => {
+        assertUserSystemctlArgs(args, "restart", REFRESH_TEST_UNIT_NAME);
+        cb(null, "", "");
+      });
+  }
+
+  function mockStartSystemctlSequence() {
+    execFileMock
+      .mockImplementationOnce((_cmd, args, _opts, cb) => {
+        assertUserSystemctlArgs(args, "status");
+        cb(null, "", "");
+      })
+      .mockImplementationOnce((_cmd, args, _opts, cb) => {
+        assertUserSystemctlArgs(args, "reset-failed", REFRESH_TEST_UNIT_NAME);
+        cb(null, "", "");
+      })
+      .mockImplementationOnce((_cmd, args, _opts, cb) => {
+        assertUserSystemctlArgs(args, "start", REFRESH_TEST_UNIT_NAME);
+        cb(null, "", "");
+      });
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    execFileMock.mockReset();
+    assertNoSystemSystemdOwnershipMock.mockReset();
+    assertNoSystemSystemdOwnershipMock.mockResolvedValue();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("updates a file-managed dotenv key in gateway.systemd.env on plain restart (no version/port drift)", async () => {
+    await withInstalledUnitFixture(async ({ env, stateDir, unitPath, envFilePath }) => {
+      await fs.writeFile(
+        unitPath,
+        [
+          "[Service]",
+          "ExecStart=/usr/bin/openclaw gateway run",
+          `EnvironmentFile=-${envFilePath}`,
+          "Environment=OPENCLAW_GATEWAY_PORT=18789",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(envFilePath, "ANTHROPIC_API_KEY=old-value\n", {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await fs.writeFile(path.join(stateDir, ".env"), "ANTHROPIC_API_KEY=new-value\n", "utf8");
+
+      mockRestartSystemctlSequence();
+      const { stdout, write } = createWritableStreamMock();
+
+      // A plain restart never re-runs staging (writeSystemdUnit); this is the
+      // exact "no version/port drift" path that used to leave the stale file
+      // value in place (#118503).
+      await restartSystemdService({ stdout, env });
+
+      const envFile = await fs.readFile(envFilePath, "utf8");
+      expect(envFile).toBe("ANTHROPIC_API_KEY=new-value\n");
+      expect(requireFirstWrite(write)).toContain("Restarted systemd service");
+    });
+  });
+
+  it("preserves an operator-only secret absent from .env during the restart refresh", async () => {
+    await withInstalledUnitFixture(async ({ env, stateDir, unitPath, envFilePath }) => {
+      await fs.writeFile(
+        unitPath,
+        [
+          "[Service]",
+          "ExecStart=/usr/bin/openclaw gateway run",
+          `EnvironmentFile=-${envFilePath}`,
+        ].join("\n"),
+        "utf8",
+      );
+      // OPENROUTER_API_KEY was hand-added by the operator; it is not managed
+      // by OpenClaw and does not appear in the state-dir .env at all.
+      await fs.writeFile(
+        envFilePath,
+        ["OPENROUTER_API_KEY=or-operator-key", "ANTHROPIC_API_KEY=old-value"].join("\n") + "\n",
+        { encoding: "utf8", mode: 0o600 },
+      );
+      await fs.writeFile(path.join(stateDir, ".env"), "ANTHROPIC_API_KEY=new-value\n", "utf8");
+
+      mockRestartSystemctlSequence();
+      const { stdout } = createWritableStreamMock();
+      await restartSystemdService({ stdout, env });
+
+      const envFile = await fs.readFile(envFilePath, "utf8");
+      expect(envFile).toContain("OPENROUTER_API_KEY=or-operator-key");
+      expect(envFile).toContain("ANTHROPIC_API_KEY=new-value");
+    });
+  });
+
+  it("still drops a stale inline-managed key from the env file on restart refresh (#76860)", async () => {
+    await withInstalledUnitFixture(async ({ env, stateDir, unitPath, envFilePath }) => {
+      // OPENCLAW_GATEWAY_TOKEN is inline-managed (fresh value in Environment=)
+      // and marked via OPENCLAW_SERVICE_MANAGED_ENV_KEYS; the env file still
+      // carries a stale copy from a previous install/repair.
+      await fs.writeFile(
+        unitPath,
+        [
+          "[Service]",
+          "ExecStart=/usr/bin/openclaw gateway run",
+          `EnvironmentFile=-${envFilePath}`,
+          "Environment=OPENCLAW_GATEWAY_TOKEN=fresh-inline-token",
+          "Environment=OPENCLAW_SERVICE_MANAGED_ENV_KEYS=OPENCLAW_GATEWAY_TOKEN",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(
+        envFilePath,
+        ["OPENCLAW_GATEWAY_TOKEN=stale-file-token", "OPENROUTER_API_KEY=or-operator-key"].join(
+          "\n",
+        ) + "\n",
+        { encoding: "utf8", mode: 0o600 },
+      );
+      await fs.writeFile(path.join(stateDir, ".env"), "LLM_API_KEY=dotenv-key\n", "utf8");
+
+      mockRestartSystemctlSequence();
+      const { stdout } = createWritableStreamMock();
+      await restartSystemdService({ stdout, env });
+
+      const [unit, envFile] = await Promise.all([
+        fs.readFile(unitPath, "utf8"),
+        fs.readFile(envFilePath, "utf8"),
+      ]);
+      // The stale EnvironmentFile copy must stay dropped; EnvironmentFile takes
+      // precedence over inline Environment=, so keeping it would silently
+      // revert the fresh inline token on every unit reload.
+      expect(envFile).not.toContain("OPENCLAW_GATEWAY_TOKEN");
+      expect(envFile).toContain("OPENROUTER_API_KEY=or-operator-key");
+      expect(envFile).toContain("LLM_API_KEY=dotenv-key");
+      expect(unit).toContain("Environment=OPENCLAW_GATEWAY_TOKEN=fresh-inline-token");
+    });
+  });
+
+  it("applies the same refresh on plain start", async () => {
+    await withInstalledUnitFixture(async ({ env, stateDir, unitPath, envFilePath }) => {
+      await fs.writeFile(
+        unitPath,
+        [
+          "[Service]",
+          "ExecStart=/usr/bin/openclaw gateway run",
+          `EnvironmentFile=-${envFilePath}`,
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(envFilePath, "ANTHROPIC_API_KEY=old-value\n", {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await fs.writeFile(path.join(stateDir, ".env"), "ANTHROPIC_API_KEY=new-value\n", "utf8");
+
+      mockStartSystemctlSequence();
+      const { stdout } = createWritableStreamMock();
+      await startSystemdService({ stdout, env });
+
+      const envFile = await fs.readFile(envFilePath, "utf8");
+      expect(envFile).toBe("ANTHROPIC_API_KEY=new-value\n");
+    });
+  });
+
+  it("refreshes the system-scope unit's env file on restart, not a user-scope path (#118503)", async () => {
+    await withInstalledUnitFixture(async ({ env, stateDir, envFilePath }) => {
+      // No user-scope unit is written by this fixture; only a system-scope
+      // unit is faked below. readSystemdServiceExecStart always resolves the
+      // user-scope path, so if the refresh call site regresses back to it,
+      // this system-scope install would silently no-op the refresh.
+      const systemUnitPath = "/etc/systemd/system/openclaw-gateway-refresh-test.service";
+      const systemUnitContent = [
+        "[Service]",
+        "ExecStart=/usr/bin/openclaw gateway run",
+        `EnvironmentFile=-${envFilePath}`,
+      ].join("\n");
+      await fs.writeFile(envFilePath, "ANTHROPIC_API_KEY=old-value\n", {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await fs.writeFile(path.join(stateDir, ".env"), "ANTHROPIC_API_KEY=new-value\n", "utf8");
+
+      const realAccess = fs.access.bind(fs);
+      vi.spyOn(fs, "access").mockImplementation(async (pathArg) => {
+        if (pathLikeToString(pathArg) === systemUnitPath) {
+          return undefined;
+        }
+        return realAccess(pathArg);
+      });
+      const realReadFile = fs.readFile.bind(fs);
+      vi.spyOn(fs, "readFile").mockImplementation(async (pathArg) => {
+        if (pathLikeToString(pathArg) === systemUnitPath) {
+          return systemUnitContent;
+        }
+        return realReadFile(pathArg, "utf8");
+      });
+      mockEffectiveUid(0);
+
+      execFileMock
+        .mockImplementationOnce((_cmd, args, _opts, cb) => {
+          expect(args).toEqual(["reset-failed", REFRESH_TEST_UNIT_NAME]);
+          cb(null, "", "");
+        })
+        .mockImplementationOnce((_cmd, args, _opts, cb) => {
+          expect(args).toEqual(["restart", REFRESH_TEST_UNIT_NAME]);
+          cb(null, "", "");
+        });
+
+      const { stdout, write } = createWritableStreamMock();
+      await restartSystemdService({ stdout, env });
+
+      const envFile = await realReadFile(envFilePath, "utf8");
+      expect(envFile).toBe("ANTHROPIC_API_KEY=new-value\n");
+      expect(requireFirstWrite(write)).toContain("Restarted systemd service");
+    });
+  });
+
+  it("refreshes node.systemd.env, not gateway.systemd.env, for a node-kind service", async () => {
+    await withInstalledUnitFixture(async ({ env, stateDir, unitPath }) => {
+      // A real installed unit always writes OPENCLAW_SERVICE_KIND as an inline
+      // Environment= line (see inspect.test.ts's real-unit fixture), so the
+      // command.environment read back here carries it too and
+      // resolveSystemdEnvironmentFilePath picks the node-specific file.
+      const nodeEnvFilePath = path.join(stateDir, "node.systemd.env");
+      const gatewayEnvFilePath = path.join(stateDir, "gateway.systemd.env");
+      await fs.writeFile(
+        unitPath,
+        [
+          "[Service]",
+          "ExecStart=/usr/bin/openclaw node run",
+          `EnvironmentFile=-${nodeEnvFilePath}`,
+          "Environment=OPENCLAW_SERVICE_KIND=node",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(nodeEnvFilePath, "OPENCLAW_GATEWAY_TOKEN=old-node-token\n", {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await fs.writeFile(
+        path.join(stateDir, ".env"),
+        "OPENCLAW_GATEWAY_TOKEN=new-node-token\n",
+        "utf8",
+      );
+
+      mockRestartSystemctlSequence();
+      const { stdout } = createWritableStreamMock();
+      await restartSystemdService({ stdout, env: { ...env, OPENCLAW_SERVICE_KIND: "node" } });
+
+      const nodeEnvFile = await fs.readFile(nodeEnvFilePath, "utf8");
+      expect(nodeEnvFile).toBe("OPENCLAW_GATEWAY_TOKEN=new-node-token\n");
+      await expect(fs.access(gatewayEnvFilePath)).rejects.toThrow();
+    });
+  });
+
+  it("does not touch the env file when no unit is installed", async () => {
+    await withInstalledUnitFixture(async ({ env, stateDir, envFilePath }) => {
+      // No unit file was written; findInstalledSystemdGatewayScope resolves to
+      // null and readSystemdServiceExecStart returns null, so refresh is a no-op.
+      await fs.writeFile(path.join(stateDir, ".env"), "ANTHROPIC_API_KEY=new-value\n", "utf8");
+
+      execFileMock
+        .mockImplementationOnce((_cmd, args, _opts, cb) => {
+          assertUserSystemctlArgs(args, "status");
+          cb(null, "", "");
+        })
+        .mockImplementationOnce((_cmd, args, _opts, cb) => {
+          assertUserSystemctlArgs(args, "reset-failed", REFRESH_TEST_UNIT_NAME);
+          cb(null, "", "");
+        })
+        .mockImplementationOnce((_cmd, args, _opts, cb) => {
+          assertUserSystemctlArgs(args, "restart", REFRESH_TEST_UNIT_NAME);
+          cb(null, "", "");
+        });
+      const { stdout } = createWritableStreamMock();
+      await restartSystemdService({ stdout, env });
+
+      await expect(fs.access(envFilePath)).rejects.toThrow();
+    });
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
